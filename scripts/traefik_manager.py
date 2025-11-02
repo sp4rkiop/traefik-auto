@@ -196,8 +196,8 @@ def create_docker_compose(resolver_choice: str, domain: str, email: str, cf_emai
       - "--certificatesresolvers.cf.acme.dnschallenge.delaybeforecheck=0"
       - "--entrypoints.websecure.http.tls.certresolver=cf"
     environment:
-      - CF_API_EMAIL={cf_email}
-      - CF_DNS_API_TOKEN={cf_token}
+      CF_API_EMAIL: "{cf_email}"
+      CF_DNS_API_TOKEN: "{cf_token}"
 """
 
     compose = f"""services:
@@ -228,7 +228,7 @@ def create_docker_compose(resolver_choice: str, domain: str, email: str, cf_emai
       - "--providers.file.filename=/dynamic/tls.yaml"
       - "--providers.docker=true"
       - "--providers.docker.exposedbydefault=false"
-      - "--providers.docker.network=proxy"
+      - "--providers.docker.network=traefik"
       - "--api.dashboard=true"
       - "--api.insecure=false"
       - "--log.level=INFO"
@@ -240,6 +240,7 @@ def create_docker_compose(resolver_choice: str, domain: str, email: str, cf_emai
       - "traefik.http.routers.dashboard.entrypoints=websecure"
       - "traefik.http.routers.dashboard.service=api@internal"
       - "traefik.http.routers.dashboard.tls=true"
+      - "traefik.http.routers.dashboard.tls.certresolver={'cf' if resolver_choice == '3' else 'le'}"
       - "traefik.http.middlewares.dashboard-auth.basicauth.users={auth_hash}"
       - "traefik.http.routers.dashboard.middlewares=dashboard-auth@docker"
 
@@ -250,11 +251,12 @@ networks:
     _ = Path(COMPOSE_FILE).write_text(compose)
     print_message("ok", f"Docker Compose file created at {COMPOSE_FILE}")
 
-def create_test_compose(domain: str | None) -> None:
+def create_test_compose(resolver_choice : str, domain: str | None) -> None:
     """Create test page Docker Compose file using Nginx with a custom page"""
     if not domain:
         return
-    
+    resolver_name = "cf" if resolver_choice == "3" else "le"
+
     # Use the global test compose path
     Path(TEST_COMPOSE_PATH).mkdir(parents=True, exist_ok=True)
     
@@ -279,7 +281,7 @@ services:
       - "traefik.enable=true"
       - "traefik.http.routers.nginx-test.rule=Host(`test.{domain}`)"
       - "traefik.http.routers.nginx-test.entrypoints=websecure"
-      - "traefik.http.routers.nginx-test.tls.certresolver=letsencrypt"
+      - "traefik.http.routers.nginx-test.tls.certresolver={resolver_name}"
 
 networks:
   traefik:
@@ -399,11 +401,12 @@ def main() -> None:
     # Setup
     ensure_dirs()
     resolver_choice, domain, email, cf_email, cf_token = ask_for_resolver()
-    create_self_signed_cert(domain)
+    if resolver_choice == "1":
+        create_self_signed_cert(domain)
+        create_dynamic_tls()
     create_htpasswd()
-    create_dynamic_tls()
     create_docker_compose(resolver_choice, domain, email, cf_email, cf_token)
-    create_test_compose(domain)
+    create_test_compose(resolver_choice, domain)
     setup_docker_network()
     
     # Deploy
