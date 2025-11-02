@@ -67,7 +67,7 @@ def ensure_dirs():
     print_message("ok", "Created Traefik directories")
 
 def create_self_signed_cert(domain: str):
-    print_message("info", "Generating self-signed certificate for *.docker.localhost ...")
+    print_message("info", f"Generating self-signed certificate for *.{domain} ...")
     _ = run_command(f"openssl req -x509 -nodes -days 365 -newkey rsa:2048 \
         -keyout {TRAEFIK_CERTS_PATH}/local.key \
         -out {TRAEFIK_CERTS_PATH}/local.crt \
@@ -208,7 +208,7 @@ def create_docker_compose(resolver_choice: str, domain: str, email: str, cf_emai
     security_opt:
       - no-new-privileges:true
     networks:
-      - proxy
+      - traefik
     ports:
       - "80:80"
       - "443:443"
@@ -244,8 +244,8 @@ def create_docker_compose(resolver_choice: str, domain: str, email: str, cf_emai
       - "traefik.http.routers.dashboard.middlewares=dashboard-auth@docker"
 
 networks:
-  proxy:
-    name: proxy
+  traefik:
+    external: true
 """
     _ = Path(COMPOSE_FILE).write_text(compose)
     print_message("ok", f"Docker Compose file created at {COMPOSE_FILE}")
@@ -284,7 +284,6 @@ services:
 networks:
   traefik:
     external: true
-    name: traefik
 """
     
     with open(f"{TEST_COMPOSE_PATH}/docker-compose-test.yml", "w", encoding="utf-8") as f:
@@ -328,7 +327,7 @@ def deploy_test_page(test_domain: str | None) -> None:
     compose_cmd = ["docker", "compose", "-f", f"{TEST_COMPOSE_PATH}/docker-compose-test.yml", "up", "-d"]
     
     if run_command(compose_cmd):
-        print_message("success", f"Test page deployed at https://{test_domain}")
+        print_message("success", f"Test page deployed at https://test.{test_domain}")
         
         # Schedule auto-removal
         import shlex
