@@ -13,7 +13,7 @@ if [[ $EUID -ne 0 ]]; then
   exit 1
 fi
 
-URL="https://raw.githubusercontent.com/sp4rkiop/traefik-auto/main/py-scripts/traefik_manager.py"
+URL="https://raw.githubusercontent.com/sp4rkiop/traefik-auto/refs/heads/main/py-scripts/traefik_manager.py"
 FILE_NAME="/tmp/traefik_manager.py"
 
 echo "🚀 Traefik Automated Setup"
