@@ -1,5 +1,7 @@
 #!/usr/bin/env python3
 
+import os
+import shutil
 import sys
 import subprocess
 import time
@@ -60,6 +62,41 @@ def run_command(cmd: str | list[str], shell: bool = False) -> bool:
     except Exception as e:
         print_message("error", f"Unexpected error: {e}")
         return False
+
+def uninstall_traefik():
+    print("\n🧹 Starting Traefik uninstallation...\n")
+
+    # Stop and remove via Docker Compose if present
+    compose_file = "/opt/traefik/docker-compose.yml"
+    if os.path.exists(compose_file):
+        try:
+            _ = subprocess.run(["docker", "compose", "-f", compose_file, "down", "-v"], check=True)
+            print("✅ Traefik containers stopped and removed.")
+        except subprocess.CalledProcessError:
+            print("⚠️ Could not stop Traefik via docker compose, checking manually...")
+
+    # Check for any leftover Traefik containers
+    try:
+        _ = subprocess.run(["docker", "rm", "-f", "traefik"], check=False)
+        print("✅ Any leftover Traefik containers removed.")
+    except Exception:
+        pass
+
+    # Remove traefik directory
+    if os.path.exists("/opt/traefik"):
+        try:
+            shutil.rmtree("/opt/traefik")
+            print("✅ /opt/traefik directory removed.")
+        except Exception as e:
+            print(f"⚠️ Failed to remove /opt/traefik: {e}")
+
+    # Remove network if it exists
+    try:
+        _ = subprocess.run(["docker", "network", "rm", "traefik"], check=False)
+    except Exception:
+        pass
+
+    print("\n🧼 Traefik has been completely removed.\n")
 
 def ensure_dirs():
     for d in [TRAEFIK_BASE_PATH, TRAEFIK_CERTS_PATH, TRAEFIK_DYNAMIC_PATH]:
@@ -193,7 +230,7 @@ def create_docker_compose(resolver_choice: str, domain: str, email: str, cf_emai
       - "--certificatesresolvers.cf.acme.email={email}"
       - "--certificatesresolvers.cf.acme.storage=/letsencrypt/acme.json"
       - "--certificatesresolvers.cf.acme.dnschallenge.provider=cloudflare"
-      - "--certificatesresolvers.cf.acme.dnschallenge.delaybeforecheck=0"
+      - "--certificatesresolvers.cf.acme.dnschallenge.delaybeforecheck=10"
       - "--entrypoints.websecure.http.tls.certresolver=cf"
     environment:
       CF_API_EMAIL: "{cf_email}"
@@ -381,7 +418,7 @@ def display_final_info(domain: str | None) -> None:
     print("To manage Traefik:")
     print(f"  cd {TRAEFIK_BASE_PATH} && docker compose [logs|restart|down]")
     if domain:
-        print("\nAccess URLs:")
+        print("\nAccess URLs ( Will be accessible once you add DNS records ):")
         print(f"  Dashboard → https://traefik.{domain}")
         print(f"  Test page    → https://test.{domain}")
         print("Use your Basic Auth credentials when prompted.")
@@ -418,4 +455,16 @@ def main() -> None:
     print_message("success", "Setup complete! 🎉")
 
 if __name__ == "__main__":
+    print("=== Traefik Installation Script ===")
+    print("1. Install Traefik")
+    print("2. Uninstall Traefik")
+    choice = input("Select an option (1/2): ").strip()
+
+    if choice == "2":
+        uninstall_traefik()
+        exit(0)
+    elif choice != "1":
+        print("Invalid choice. Exiting.")
+        exit(1)
+
     main()
