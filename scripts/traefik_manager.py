@@ -1,6 +1,5 @@
 #!/usr/bin/env python3
 
-import os
 import sys
 import subprocess
 import time
@@ -8,9 +7,12 @@ from pathlib import Path
 
 # Global configuration constants
 TRAEFIK_BASE_PATH = "/opt/traefik"
-TRAEFIK_CONFIG_PATH = "/etc/traefik"
-TRAEFIK_CERTS_PATH = "/etc/traefik/certs"
-TEST_COMPOSE_PATH = "/tmp/traefik_test_page"
+TRAEFIK_CERTS_PATH = f"{TRAEFIK_BASE_PATH}/certs"
+TRAEFIK_DYNAMIC_PATH = f"{TRAEFIK_BASE_PATH}/dynamic"
+HTPASSWD_FILE = f"{TRAEFIK_BASE_PATH}/.htpasswd"
+COMPOSE_FILE = f"{TRAEFIK_BASE_PATH}/docker-compose.yml"
+TLS_FILE = f"{TRAEFIK_DYNAMIC_PATH}/tls.yaml"
+TEST_COMPOSE_PATH = "/tmp/traefik_test_page" 
 TEST_SCRIPT_PATH = "/tmp/remove_test_page.sh"
 
 # Colors for output
@@ -59,6 +61,68 @@ def run_command(cmd: str | list[str], shell: bool = False) -> bool:
         print_message("error", f"Unexpected error: {e}")
         return False
 
+def ensure_dirs():
+    for d in [TRAEFIK_BASE_PATH, TRAEFIK_CERTS_PATH, TRAEFIK_DYNAMIC_PATH]:
+        Path(d).mkdir(parents=True, exist_ok=True)
+    print_message("ok", "Created Traefik directories")
+
+def create_self_signed_cert(domain: str):
+    print_message("info", "Generating self-signed certificate for *.docker.localhost ...")
+    _ = run_command(f"openssl req -x509 -nodes -days 365 -newkey rsa:2048 \
+        -keyout {TRAEFIK_CERTS_PATH}/local.key \
+        -out {TRAEFIK_CERTS_PATH}/local.crt \
+        -subj '/CN=*.{domain}'", shell=True)
+    print_message("ok", "Self-signed certificate created")
+
+def create_htpasswd():
+    print_message("info", "Creating Basic Auth credentials for Traefik Dashboard...")
+    user = input("Enter dashboard username [admin]: ").strip() or "admin"
+    password = input("Enter dashboard password [P@ssw0rd]: ").strip() or "P@ssw0rd"
+    if not run_command("which htpasswd", shell=True):
+        print_message("err", "htpasswd not found! Install apache2-utils first.")
+        sys.exit(1)
+    result = subprocess.run(
+        f"htpasswd -nb {user} '{password}' | sed -e 's/\\$/$$/g'",
+        shell=True, capture_output=True, text=True
+    )
+    with open(HTPASSWD_FILE, "w") as f:
+        _ = f.write(result.stdout.strip())
+    print_message("ok", f"Dashboard credentials created and stored in {HTPASSWD_FILE}")
+
+def create_dynamic_tls():
+    content = """tls:
+  certificates:
+    - certFile: /certs/local.crt
+      keyFile:  /certs/local.key
+"""
+    _ = Path(TLS_FILE).write_text(content)
+    print_message("ok", f"Dynamic TLS config written to {TLS_FILE}")
+
+def ask_for_resolver():
+    print("\nSSL Resolver Options:")
+    print("1. Self-signed (local HTTPS)")
+    print("2. Let's Encrypt (HTTP Challenge)")
+    print("3. Cloudflare DNS Challenge")
+    choice = input("Select resolver [1/2/3]: ").strip()
+    email = "admin@docker.localhost"
+    domain = "docker.localhost"
+    cloudflare_email = None
+    cloudflare_api_token = None
+    if choice in ["2", "3"]:
+        domain = input("Enter your domain (e.g. example.com): ").strip()
+        if not domain:
+            print_message("err", "Domain name required for Let's Encrypt/Cloudflare")
+            sys.exit(1)
+        email = input("Enter your email for Let's Encrypt: ").strip()
+        if not email:
+            email = "admin@" + domain
+    if choice == "3":
+        cloudflare_email = input("Enter Cloudflare account email: ").strip()
+        cloudflare_api_token = input("Enter Cloudflare API Token: ").strip()
+    if choice == "1":
+        domain = "docker.localhost"
+    return choice, domain, email, cloudflare_email, cloudflare_api_token
+
 def check_docker() -> None:
     """Check if Docker is installed and running"""
     print_message("status", "Checking Docker installation...")
@@ -72,14 +136,11 @@ def check_docker() -> None:
     
     print_message("success", "Docker is installed and running")
 
-def get_user_input() -> tuple[str | None, str | None]:
+def get_user_input() ->  str | None:
     """Get user input interactively"""
     print_message("status", "Traefik Setup Configuration")
     print("==================================")
     
-    email = input("Enter your email for Let's Encrypt (optional): ").strip()
-    if not email:
-        email = None
     test_domain = input("Enter test domain/subdomain (optional, e.g., test.yourdomain.com): ").strip()
     if not test_domain:
         test_domain = None
@@ -90,7 +151,7 @@ def get_user_input() -> tuple[str | None, str | None]:
             print_message("status", "Setup cancelled.")
             sys.exit(0)
     
-    return email, test_domain
+    return test_domain
 
 def check_dns_resolution(domain: str) -> None:
     """Check if domain resolves to this server"""
@@ -115,64 +176,31 @@ def check_dns_resolution(domain: str) -> None:
     except Exception as e:
         print_message("warning", f"Could not determine server IP. Please ensure {domain} points to your server. Error: {e}")
 
-def create_directories() -> None:
-    """Create necessary directories"""
-    directories = [
-        TRAEFIK_BASE_PATH,
-        TRAEFIK_CONFIG_PATH,
-        TRAEFIK_CERTS_PATH
-    ]
-    
-    for directory in directories:
-        Path(directory).mkdir(parents=True, exist_ok=True)
-    
-    print_message("success", "Directories created")
+def create_docker_compose(resolver_choice: str, domain: str, email: str, cf_email: str | None, cf_token: str | None):
+    with open(HTPASSWD_FILE) as f:
+        auth_hash = f.read().strip()
 
-def create_traefik_config(email: str | None) -> None:
-    """Create Traefik configuration file"""
-    config_content = f"""# Traefik Global Configuration
-global:
-  checkNewVersion: false
-  sendAnonymousUsage: false
-api:
-  dashboard: true
-  insecure: false
-
-entryPoints:
-  web:
-    address: ":80"
-    http:
-      redirections:
-        entryPoint:
-          to: websecure
-          scheme: https
-  websecure:
-    address: ":443"
-
-providers:
-  docker:
-    endpoint: "unix:///var/run/docker.sock"
-    exposedByDefault: false
-
-certificatesResolvers:
-  letsencrypt:
-    acme:
-      email: {email or "admin@example.com"}
-      storage: {TRAEFIK_CERTS_PATH}/acme.json
-      httpChallenge:
-        entryPoint: web
+    resolver_config = ""
+    if resolver_choice == "2":  # Let's Encrypt
+        resolver_config = f"""
+      - "--certificatesresolvers.le.acme.email={email}"
+      - "--certificatesresolvers.le.acme.storage=/letsencrypt/acme.json"
+      - "--certificatesresolvers.le.acme.httpchallenge.entrypoint=web"
+      - "--entrypoints.websecure.http.tls.certresolver=le"
 """
-    
-    with open(f"{TRAEFIK_CONFIG_PATH}/traefik.yml", "w") as f:
-        _ = f.write(config_content)
-    
-    print_message("success", "Traefik configuration created")
+    elif resolver_choice == "3":  # Cloudflare
+        resolver_config = f"""
+      - "--certificatesresolvers.cf.acme.email={email}"
+      - "--certificatesresolvers.cf.acme.storage=/letsencrypt/acme.json"
+      - "--certificatesresolvers.cf.acme.dnschallenge.provider=cloudflare"
+      - "--certificatesresolvers.cf.acme.dnschallenge.delaybeforecheck=0"
+      - "--entrypoints.websecure.http.tls.certresolver=cf"
+    environment:
+      - CF_API_EMAIL={cf_email}
+      - CF_DNS_API_TOKEN={cf_token}
+"""
 
-def create_traefik_compose() -> None:
-    """Create Docker Compose file for Traefik"""
-    compose_content = """version: '3.8'
-
-services:
+    compose = f"""services:
   traefik:
     image: traefik:v3.4
     container_name: traefik
@@ -180,37 +208,58 @@ services:
     security_opt:
       - no-new-privileges:true
     networks:
-      - traefik
+      - proxy
     ports:
       - "80:80"
       - "443:443"
       - "8080:8080"
     volumes:
       - /var/run/docker.sock:/var/run/docker.sock:ro
-      - {TRAEFIK_CONFIG_PATH}/traefik.yml:/etc/traefik/traefik.yml:ro
-      - {TRAEFIK_CERTS_PATH}:/etc/traefik/certs
+      - ./certs:/certs:ro
+      - ./dynamic:/dynamic:ro
+      - ./letsencrypt:/letsencrypt
+    command:
+      - "--entrypoints.web.address=:80"
+      - "--entrypoints.web.http.redirections.entrypoint.to=websecure"
+      - "--entrypoints.web.http.redirections.entrypoint.scheme=https"
+      - "--entrypoints.web.http.redirections.entrypoint.permanent=true"
+      - "--entrypoints.websecure.address=:443"
+      - "--entrypoints.websecure.http.tls=true"
+      - "--providers.file.filename=/dynamic/tls.yaml"
+      - "--providers.docker=true"
+      - "--providers.docker.exposedbydefault=false"
+      - "--providers.docker.network=proxy"
+      - "--api.dashboard=true"
+      - "--api.insecure=false"
+      - "--log.level=INFO"
+      - "--accesslog=true"
+      - "--metrics.prometheus=true"{resolver_config}
+    labels:
+      - "traefik.enable=true"
+      - "traefik.http.routers.dashboard.rule=Host(`traefik.{domain}`)"
+      - "traefik.http.routers.dashboard.entrypoints=websecure"
+      - "traefik.http.routers.dashboard.service=api@internal"
+      - "traefik.http.routers.dashboard.tls=true"
+      - "traefik.http.middlewares.dashboard-auth.basicauth.users={auth_hash}"
+      - "traefik.http.routers.dashboard.middlewares=dashboard-auth@docker"
 
 networks:
-  traefik:
-    external: true
-    name: traefik
+  proxy:
+    name: proxy
 """
-    
-    with open(f"{TRAEFIK_BASE_PATH}/docker-compose.yml", "w") as f:
-        _ = f.write(compose_content)
-    
-    print_message("success", "Docker Compose configuration created")
+    _ = Path(COMPOSE_FILE).write_text(compose)
+    print_message("ok", f"Docker Compose file created at {COMPOSE_FILE}")
 
-def create_test_compose(test_domain: str | None) -> None:
+def create_test_compose(domain: str | None) -> None:
     """Create test page Docker Compose file using Nginx with a custom page"""
-    if not test_domain:
+    if not domain:
         return
     
     # Use the global test compose path
     Path(TEST_COMPOSE_PATH).mkdir(parents=True, exist_ok=True)
     
     # Create index.html with proper escaping
-    index_content = f"<h1>Traefik + Nginx Test Page</h1><p>Domain: {test_domain}</p>"
+    index_content = f"<h1>Traefik + Nginx Test Page</h1><p>Domain: test.{domain}</p>"
     with open(f"{TEST_COMPOSE_PATH}/index.html", "w", encoding="utf-8") as f:
         _ = f.write(index_content)
     
@@ -228,7 +277,7 @@ services:
       - {Path(TEST_COMPOSE_PATH).resolve()}:/usr/share/nginx/html:ro
     labels:
       - "traefik.enable=true"
-      - "traefik.http.routers.nginx-test.rule=Host(`{test_domain}`)"
+      - "traefik.http.routers.nginx-test.rule=Host(`test.{domain}`)"
       - "traefik.http.routers.nginx-test.entrypoints=websecure"
       - "traefik.http.routers.nginx-test.tls.certresolver=letsencrypt"
 
@@ -260,11 +309,6 @@ def setup_docker_network() -> None:
 def deploy_traefik() -> None:
     """Deploy Traefik"""
     print_message("status", "Deploying Traefik...")
-    
-    try:
-        os.chdir(TRAEFIK_BASE_PATH)
-    except OSError as e:
-        print_message("error", f"Failed to change to {TRAEFIK_BASE_PATH} directory: {e}")
     
     # Start services with proper argument handling
     compose_cmd = ["docker", "compose", "-f", f"{TRAEFIK_BASE_PATH}/docker-compose.yml", "up", "-d"]
@@ -311,20 +355,19 @@ echo "✅ Test page removed successfully"
         removal_time = time.strftime("%H:%M:%S", time.localtime(time.time() + 600))
         print_message("warning", f"Test page will auto-remove in 10 minutes (at {removal_time})")
 
-def display_final_info(test_domain: str | None) -> None:
+def display_final_info(domain: str | None) -> None:
     """Display final setup information"""
     print_message("success", "Traefik setup completed!")
     print("")
     print("Summary:")
     print("--------")
-    print(f"• Traefik configuration: {TRAEFIK_CONFIG_PATH}/")
     print(f"• Docker Compose files: {TRAEFIK_BASE_PATH}/")
     print("• Docker network: traefik")
     print("")
     
-    if test_domain:
+    if domain:
         print("🎉 Your test page is available at:")
-        print(f"  • https://{test_domain}")
+        print(f"  • https://test.{domain}")
         print("")
         print("⏰ Test page will auto-remove in 10 minutes")
     else:
@@ -336,39 +379,40 @@ def display_final_info(test_domain: str | None) -> None:
     print("")
     print("To manage Traefik:")
     print(f"  cd {TRAEFIK_BASE_PATH} && docker compose [logs|restart|down]")
+    if domain:
+        print("\nAccess URLs:")
+        print(f"  Dashboard → https://traefik.{domain}")
+        print(f"  Test page    → https://test.{domain}")
+        print("Use your Basic Auth credentials when prompted.")
     print("")
     
-    if test_domain:
+    if domain:
         print("To manually remove test page early:")
         print(f"  docker compose -f {TEST_COMPOSE_PATH}/docker-compose-test.yml down")
 
 def main() -> None:
     """Main setup function"""
-    print_message("status", "Starting Traefik automated setup...")
+    print_message("status", "Starting automated Traefik setup...")
     
     # Check prerequisites
     check_docker()
     
-    # Get user input
-    email, test_domain = get_user_input()
-    
-    # Check DNS if domain provided
-    if test_domain:
-        check_dns_resolution(test_domain)
-    
     # Setup
-    create_directories()
-    create_traefik_config(email)
-    create_traefik_compose()
-    create_test_compose(test_domain)
+    ensure_dirs()
+    resolver_choice, domain, email, cf_email, cf_token = ask_for_resolver()
+    create_self_signed_cert(domain)
+    create_htpasswd()
+    create_dynamic_tls()
+    create_docker_compose(resolver_choice, domain, email, cf_email, cf_token)
+    create_test_compose(domain)
     setup_docker_network()
     
     # Deploy
     deploy_traefik()
-    deploy_test_page(test_domain)
+    deploy_test_page(domain)
     
     # Final info
-    display_final_info(test_domain)
+    display_final_info(domain)
     print_message("success", "Setup complete! 🎉")
 
 if __name__ == "__main__":
